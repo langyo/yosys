@@ -48,6 +48,12 @@ USING_YOSYS_NAMESPACE
 #include "VeriWrite.h"
 #include "VhdlUnits.h"
 #include "VeriLibrary.h"
+#include "VeriVisitor.h"
+#include "VeriStatement.h"
+#include "VeriExpression.h"
+#include "VeriCopy.h"
+#include "VeriScope.h"
+#include "veri_tokens.h"
 
 #ifndef SYMBIOTIC_VERIFIC_API_VERSION
 #  error "Only Symbiotic EDA flavored Verific is supported. Please contact office@symbioticeda.com for commercial support for Yosys+Verific."
@@ -1398,6 +1404,16 @@ void VerificImporter::import_netlist(RTLIL::Design *design, Netlist *nl, std::se
 				continue;
 		}
 
+		if (inst->Type() == PRIM_SEDA_INITSTATE)
+		{
+			SigBit initstate = module->Initstate(new_verific_id(inst));
+			SigBit sig_o = net_map_at(inst->GetOutput());
+			module->connect(sig_o, initstate);
+
+			if (!mode_keep)
+				continue;
+		}
+
 		if (!mode_keep && verific_sva_prims.count(inst->Type())) {
 			if (verific_verbose)
 				log("    skipping SVA cell in non k-mode\n");
@@ -1962,6 +1978,88 @@ bool check_noverific_env()
 		return false;
 	return true;
 }
+
+class InitialAssertionRewriter : public VeriVisitor
+{
+public:
+	InitialAssertionRewriter() {}
+	virtual ~InitialAssertionRewriter() {}
+
+	virtual void VERI_VISIT(VeriModule, node) override {
+		log_assert(asserts.empty());
+		VeriVisitor::VERI_VISIT_NODE(VeriModule, node);
+		if (!asserts.empty()) {
+			Array *stmts = new Array;
+			for (const auto &i : asserts)
+				if (i.first)
+					stmts->Insert(new VeriConditionalStatement(i.first, i.second, 0));
+				else
+					stmts->Insert(i.second);
+			auto block = new VeriSeqBlock(0, 0, stmts, new VeriScope(0, node.GetScope()));
+			auto if_stmt = new VeriConditionalStatement(new VeriSystemFunctionCall(Strings::save("initstate"), 0), block, 0);
+			auto always = new VeriAlwaysConstruct(if_stmt);
+			always->SetQualifier(VERI_ALWAYS_COMB);
+			node.AddModuleItem(always);
+			asserts.clear();
+			node.PrettyPrint(std::cout, 0);
+		}
+	}
+
+	virtual void VERI_VISIT(VeriAlwaysConstruct, ) override {}
+	virtual void VERI_VISIT(VeriInitialConstruct, node) override
+	{
+		log_assert(stack.empty());
+		VeriVisitor::VERI_VISIT_NODE(VeriInitialConstruct, node);
+	}
+
+	virtual void VERI_VISIT(VeriConditionalStatement, node) override
+	{
+		auto if_expr = node.GetIfExpr();
+		auto then_stmt = node.GetThenStmt();
+		log_assert(then_stmt);
+		stack.emplace_back(if_expr, true);
+		then_stmt->Accept(*this);
+		auto else_stmt = node.GetElseStmt();
+		if (else_stmt) {
+			stack.back().second = false;
+			else_stmt->Accept(*this);
+		}
+		stack.pop_back();
+	}
+
+	virtual void VERI_VISIT(VeriAssertion, node) override
+	{
+		auto type = node.GetAssertCoverProperty();
+		if (type != VERI_ASSERT && type != VERI_ASSUME)
+			return;
+
+		VeriExpression *expr = 0;
+		if (stack.size() == 1) {
+			VeriMapForCopy id_map_table;
+			auto &i = stack.front();
+			auto cond = i.first->CopyExpression(id_map_table);
+			expr = i.second ? cond : new VeriUnaryOperator(VERI_NOT, cond);
+		}
+		else if (stack.size() > 1) {
+			Array *concat = new Array;
+			for (const auto &i : stack) {
+				VeriMapForCopy id_map_table;
+				auto cond = i.first->CopyExpression(id_map_table);
+				concat->Insert(i.second ? cond : new VeriUnaryOperator(VERI_NOT, cond));
+			}
+			expr = new VeriUnaryOperator(VERI_REDAND, new VeriConcat(concat));
+		}
+		VeriMapForCopy id_map_table;
+		asserts.emplace_back(expr, node.CopyStatement(id_map_table));
+	}
+private:
+	// Prevent the compiler from implementing the following
+	InitialAssertionRewriter(const InitialAssertionRewriter &node) ;
+	InitialAssertionRewriter& operator=(const InitialAssertionRewriter &rhs) ;
+
+	std::vector<std::pair<VeriExpression*,bool> > stack;
+	std::vector<std::pair<VeriExpression*,VeriStatement*>> asserts;
+} ;
 #endif
 
 struct VerificPass : public Pass {
@@ -2426,7 +2524,14 @@ struct VerificPass : public Pass {
 
 				Array veri_libs, vhdl_libs;
 				if (vhdl_lib) vhdl_libs.InsertLast(vhdl_lib);
-				if (veri_lib) veri_libs.InsertLast(veri_lib);
+				if (veri_lib) {
+					veri_libs.InsertLast(veri_lib);
+					InitialAssertionRewriter rw;
+					MapIter mi;
+					VeriModule *veri_module;
+					FOREACH_VERILOG_MODULE_IN_LIBRARY(veri_lib, mi, veri_module)
+						veri_module->Accept(rw);
+				}
 
 				Array *netlists = hier_tree::ElaborateAll(&veri_libs, &vhdl_libs, &parameters);
 				Netlist *nl;
@@ -2441,6 +2546,7 @@ struct VerificPass : public Pass {
 				if (argidx == GetSize(args))
 					cmd_error(args, argidx, "No top module specified.\n");
 
+				InitialAssertionRewriter rw;
 				Array veri_modules, vhdl_units;
 				for (; argidx < GetSize(args); argidx++)
 				{
@@ -2452,6 +2558,7 @@ struct VerificPass : public Pass {
 						VeriModule *veri_module = veri_lib->GetModule(name, 1);
 						if (veri_module) {
 							log("Adding Verilog module '%s' to elaboration queue.\n", name);
+							veri_module->Accept(rw);
 							veri_modules.InsertLast(veri_module);
 							continue;
 						}
