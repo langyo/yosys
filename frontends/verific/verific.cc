@@ -1874,6 +1874,87 @@ struct VerificExtNets
 	}
 };
 
+class InitialAssertionRewriter : public VeriVisitor
+{
+public:
+	InitialAssertionRewriter() {}
+	virtual ~InitialAssertionRewriter() {}
+
+	virtual void VERI_VISIT(VeriModule, node) override {
+		log_assert(asserts.empty());
+		VeriVisitor::VERI_VISIT_NODE(VeriModule, node);
+		if (!asserts.empty()) {
+			Array *stmts = new Array;
+			for (const auto &i : asserts)
+				if (i.first)
+					stmts->Insert(new VeriConditionalStatement(i.first, i.second, 0));
+				else
+					stmts->Insert(i.second);
+			auto block = new VeriSeqBlock(0, 0, stmts, new VeriScope(0, node.GetScope()));
+			auto if_stmt = new VeriConditionalStatement(new VeriSystemFunctionCall(Strings::save("initstate"), 0), block, 0);
+			auto always = new VeriAlwaysConstruct(if_stmt);
+			always->SetQualifier(VERI_ALWAYS_COMB);
+			node.AddModuleItem(always);
+			asserts.clear();
+		}
+	}
+
+	virtual void VERI_VISIT(VeriAlwaysConstruct, ) override {}
+	virtual void VERI_VISIT(VeriInitialConstruct, node) override
+	{
+		log_assert(stack.empty());
+		VeriVisitor::VERI_VISIT_NODE(VeriInitialConstruct, node);
+	}
+
+	virtual void VERI_VISIT(VeriConditionalStatement, node) override
+	{
+		auto if_expr = node.GetIfExpr();
+		auto then_stmt = node.GetThenStmt();
+		log_assert(then_stmt);
+		stack.emplace_back(if_expr, true);
+		then_stmt->Accept(*this);
+		auto else_stmt = node.GetElseStmt();
+		if (else_stmt) {
+			stack.back().second = false;
+			else_stmt->Accept(*this);
+		}
+		stack.pop_back();
+	}
+
+	virtual void VERI_VISIT(VeriAssertion, node) override
+	{
+		auto type = node.GetAssertCoverProperty();
+		if (type != VERI_ASSERT && type != VERI_ASSUME)
+			return;
+
+		VeriExpression *expr = 0;
+		if (stack.size() == 1) {
+			VeriMapForCopy id_map_table;
+			auto &i = stack.front();
+			auto cond = i.first->CopyExpression(id_map_table);
+			expr = i.second ? cond : new VeriUnaryOperator(VERI_NOT, cond);
+		}
+		else if (stack.size() > 1) {
+			Array *concat = new Array;
+			for (const auto &i : stack) {
+				VeriMapForCopy id_map_table;
+				auto cond = i.first->CopyExpression(id_map_table);
+				concat->Insert(i.second ? cond : new VeriUnaryOperator(VERI_NOT, cond));
+			}
+			expr = new VeriUnaryOperator(VERI_REDAND, new VeriConcat(concat));
+		}
+		VeriMapForCopy id_map_table;
+		asserts.emplace_back(expr, node.CopyStatement(id_map_table));
+	}
+private:
+	// Prevent the compiler from implementing the following
+	InitialAssertionRewriter(const InitialAssertionRewriter &node) ;
+	InitialAssertionRewriter& operator=(const InitialAssertionRewriter &rhs) ;
+
+	std::vector<std::pair<VeriExpression*,bool> > stack;
+	std::vector<std::pair<VeriExpression*,VeriStatement*>> asserts;
+} ;
+
 void verific_import(Design *design, const std::map<std::string,std::string> &parameters, std::string top)
 {
 	verific_sva_fsm_limit = 16;
@@ -1891,7 +1972,16 @@ void verific_import(Design *design, const std::map<std::string,std::string> &par
 	for (const auto &i : parameters)
 		verific_params.Insert(i.first.c_str(), i.second.c_str());
 
+	InitialAssertionRewriter rw;
+
 	if (top.empty()) {
+		if (veri_lib) {
+			MapIter mi;
+			VeriModule *veri_module;
+			FOREACH_VERILOG_MODULE_IN_LIBRARY(veri_lib, mi, veri_module)
+				veri_module->Accept(rw);
+		}
+
 		netlists = hier_tree::ElaborateAll(&veri_libs, &vhdl_libs, &verific_params);
 	}
 	else {
@@ -1906,6 +1996,7 @@ void verific_import(Design *design, const std::map<std::string,std::string> &par
 			// Also elaborate all root modules since they may contain bind statements
 			MapIter mi;
 			FOREACH_VERILOG_MODULE_IN_LIBRARY(veri_lib, mi, veri_module) {
+				veri_module->Accept(rw);
 				if (!veri_module->IsRootModule()) continue;
 				veri_modules.InsertLast(veri_module);
 			}
@@ -1978,88 +2069,6 @@ bool check_noverific_env()
 		return false;
 	return true;
 }
-
-class InitialAssertionRewriter : public VeriVisitor
-{
-public:
-	InitialAssertionRewriter() {}
-	virtual ~InitialAssertionRewriter() {}
-
-	virtual void VERI_VISIT(VeriModule, node) override {
-		log_assert(asserts.empty());
-		VeriVisitor::VERI_VISIT_NODE(VeriModule, node);
-		if (!asserts.empty()) {
-			Array *stmts = new Array;
-			for (const auto &i : asserts)
-				if (i.first)
-					stmts->Insert(new VeriConditionalStatement(i.first, i.second, 0));
-				else
-					stmts->Insert(i.second);
-			auto block = new VeriSeqBlock(0, 0, stmts, new VeriScope(0, node.GetScope()));
-			auto if_stmt = new VeriConditionalStatement(new VeriSystemFunctionCall(Strings::save("initstate"), 0), block, 0);
-			auto always = new VeriAlwaysConstruct(if_stmt);
-			always->SetQualifier(VERI_ALWAYS_COMB);
-			node.AddModuleItem(always);
-			asserts.clear();
-			node.PrettyPrint(std::cout, 0);
-		}
-	}
-
-	virtual void VERI_VISIT(VeriAlwaysConstruct, ) override {}
-	virtual void VERI_VISIT(VeriInitialConstruct, node) override
-	{
-		log_assert(stack.empty());
-		VeriVisitor::VERI_VISIT_NODE(VeriInitialConstruct, node);
-	}
-
-	virtual void VERI_VISIT(VeriConditionalStatement, node) override
-	{
-		auto if_expr = node.GetIfExpr();
-		auto then_stmt = node.GetThenStmt();
-		log_assert(then_stmt);
-		stack.emplace_back(if_expr, true);
-		then_stmt->Accept(*this);
-		auto else_stmt = node.GetElseStmt();
-		if (else_stmt) {
-			stack.back().second = false;
-			else_stmt->Accept(*this);
-		}
-		stack.pop_back();
-	}
-
-	virtual void VERI_VISIT(VeriAssertion, node) override
-	{
-		auto type = node.GetAssertCoverProperty();
-		if (type != VERI_ASSERT && type != VERI_ASSUME)
-			return;
-
-		VeriExpression *expr = 0;
-		if (stack.size() == 1) {
-			VeriMapForCopy id_map_table;
-			auto &i = stack.front();
-			auto cond = i.first->CopyExpression(id_map_table);
-			expr = i.second ? cond : new VeriUnaryOperator(VERI_NOT, cond);
-		}
-		else if (stack.size() > 1) {
-			Array *concat = new Array;
-			for (const auto &i : stack) {
-				VeriMapForCopy id_map_table;
-				auto cond = i.first->CopyExpression(id_map_table);
-				concat->Insert(i.second ? cond : new VeriUnaryOperator(VERI_NOT, cond));
-			}
-			expr = new VeriUnaryOperator(VERI_REDAND, new VeriConcat(concat));
-		}
-		VeriMapForCopy id_map_table;
-		asserts.emplace_back(expr, node.CopyStatement(id_map_table));
-	}
-private:
-	// Prevent the compiler from implementing the following
-	InitialAssertionRewriter(const InitialAssertionRewriter &node) ;
-	InitialAssertionRewriter& operator=(const InitialAssertionRewriter &rhs) ;
-
-	std::vector<std::pair<VeriExpression*,bool> > stack;
-	std::vector<std::pair<VeriExpression*,VeriStatement*>> asserts;
-} ;
 #endif
 
 struct VerificPass : public Pass {
@@ -2546,33 +2555,23 @@ struct VerificPass : public Pass {
 				if (argidx == GetSize(args))
 					cmd_error(args, argidx, "No top module specified.\n");
 
-				InitialAssertionRewriter rw;
+				VeriLibrary* veri_lib = veri_file::GetLibrary(work.c_str(), 1);
+				VhdlLibrary *vhdl_lib = vhdl_file::GetLibrary(work.c_str(), 1);
+
 				Array veri_modules, vhdl_units;
 				for (; argidx < GetSize(args); argidx++)
 				{
 					const char *name = args[argidx].c_str();
 					top_mod_names.insert(name);
-					VeriLibrary* veri_lib = veri_file::GetLibrary(work.c_str(), 1);
 
-					if (veri_lib) {
-						VeriModule *veri_module = veri_lib->GetModule(name, 1);
-						if (veri_module) {
-							log("Adding Verilog module '%s' to elaboration queue.\n", name);
-							veri_module->Accept(rw);
-							veri_modules.InsertLast(veri_module);
-							continue;
-						}
-
-						// Also elaborate all root modules since they may contain bind statements
-						MapIter mi;
-						FOREACH_VERILOG_MODULE_IN_LIBRARY(veri_lib, mi, veri_module) {
-							if (!veri_module->IsRootModule()) continue;
-							veri_modules.InsertLast(veri_module);
-						}
+					VeriModule *veri_module = veri_lib ? veri_lib->GetModule(name, 1) : nullptr;
+					if (veri_module) {
+						log("Adding Verilog module '%s' to elaboration queue.\n", name);
+						veri_modules.InsertLast(veri_module);
+						continue;
 					}
 
-					VhdlLibrary *vhdl_lib = vhdl_file::GetLibrary(work.c_str(), 1);
-					VhdlDesignUnit *vhdl_unit = vhdl_lib->GetPrimUnit(name);
+					VhdlDesignUnit *vhdl_unit = vhdl_lib ? vhdl_lib->GetPrimUnit(name) : nullptr;
 					if (vhdl_unit) {
 						log("Adding VHDL unit '%s' to elaboration queue.\n", name);
 						vhdl_units.InsertLast(vhdl_unit);
@@ -2580,6 +2579,18 @@ struct VerificPass : public Pass {
 					}
 
 					log_error("Can't find module/unit '%s'.\n", name);
+				}
+
+				if (veri_lib) {
+					// Also elaborate all root modules since they may contain bind statements
+					InitialAssertionRewriter rw;
+					MapIter mi;
+					VeriModule *veri_module;
+					FOREACH_VERILOG_MODULE_IN_LIBRARY(veri_lib, mi, veri_module) {
+						veri_module->Accept(rw);
+						if (!veri_module->IsRootModule()) continue;
+						veri_modules.InsertLast(veri_module);
+					}
 				}
 
 				log("Running hier_tree::Elaborate().\n");
