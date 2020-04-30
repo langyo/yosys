@@ -1878,9 +1878,23 @@ class InitialAssertionRewriter : public VeriVisitor
 {
 public:
 	InitialAssertionRewriter() {}
-	virtual ~InitialAssertionRewriter() {}
+	virtual ~InitialAssertionRewriter()
+	{
+		if (that) {
+			log_assert(that == this);
+			that = nullptr;
+		}
+	}
 
-	virtual void VERI_VISIT(VeriModule, node) override {
+	void RegisterCallBack()
+	{
+		log_assert(that == nullptr);
+		that = this;
+		veri_file::RegisterCompileAsBlackbox(RewriteCallBack);
+	}
+
+	virtual void VERI_VISIT(VeriModule, node) override
+	{
 		log_assert(asserts.empty());
 		VeriVisitor::VERI_VISIT_NODE(VeriModule, node);
 		if (!asserts.empty()) {
@@ -1926,6 +1940,8 @@ public:
 		auto type = node.GetAssertCoverProperty();
 		if (type != VERI_ASSERT && type != VERI_ASSUME)
 			return;
+		if (node.GetFinalSequenceProperty() != 0)
+			return;
 
 		VeriExpression *expr = 0;
 		if (stack.size() == 1) {
@@ -1951,9 +1967,26 @@ private:
 	InitialAssertionRewriter(const InitialAssertionRewriter &node) ;
 	InitialAssertionRewriter& operator=(const InitialAssertionRewriter &rhs) ;
 
+	static unsigned RewriteCallBack(const char *module_name)
+	{
+		if (!that->visited.insert(module_name).second)
+			return 0;
+		VeriLibrary *work_lib = veri_file::GetWorkLib();
+		log_assert(work_lib);
+		VeriModule *veri_module = work_lib->GetModule(module_name, 1 /* case_sensitive */);
+		if (!veri_module)
+			log_debug("VERIFIC-DEBUG: Module '%s' not found in Verilog library.\n", module_name);
+		else
+			veri_module->Accept(*that);
+		return 0;
+	}
+	static InitialAssertionRewriter *that;
+
+	pool<std::string> visited;
 	std::vector<std::pair<VeriExpression*,bool> > stack;
 	std::vector<std::pair<VeriExpression*,VeriStatement*>> asserts;
 } ;
+InitialAssertionRewriter *InitialAssertionRewriter::that = nullptr;
 
 void verific_import(Design *design, const std::map<std::string,std::string> &parameters, std::string top)
 {
@@ -1973,15 +2006,9 @@ void verific_import(Design *design, const std::map<std::string,std::string> &par
 		verific_params.Insert(i.first.c_str(), i.second.c_str());
 
 	InitialAssertionRewriter rw;
+	rw.RegisterCallBack();
 
 	if (top.empty()) {
-		if (veri_lib) {
-			MapIter mi;
-			VeriModule *veri_module;
-			FOREACH_VERILOG_MODULE_IN_LIBRARY(veri_lib, mi, veri_module)
-				veri_module->Accept(rw);
-		}
-
 		netlists = hier_tree::ElaborateAll(&veri_libs, &vhdl_libs, &verific_params);
 	}
 	else {
@@ -1996,7 +2023,6 @@ void verific_import(Design *design, const std::map<std::string,std::string> &par
 			// Also elaborate all root modules since they may contain bind statements
 			MapIter mi;
 			FOREACH_VERILOG_MODULE_IN_LIBRARY(veri_lib, mi, veri_module) {
-				veri_module->Accept(rw);
 				if (!veri_module->IsRootModule()) continue;
 				veri_modules.InsertLast(veri_module);
 			}
@@ -2524,6 +2550,9 @@ struct VerificPass : public Pass {
 
 			std::set<std::string> top_mod_names;
 
+			InitialAssertionRewriter rw;
+			rw.RegisterCallBack();
+
 			if (mode_all)
 			{
 				log("Running hier_tree::ElaborateAll().\n");
@@ -2533,14 +2562,7 @@ struct VerificPass : public Pass {
 
 				Array veri_libs, vhdl_libs;
 				if (vhdl_lib) vhdl_libs.InsertLast(vhdl_lib);
-				if (veri_lib) {
-					veri_libs.InsertLast(veri_lib);
-					InitialAssertionRewriter rw;
-					MapIter mi;
-					VeriModule *veri_module;
-					FOREACH_VERILOG_MODULE_IN_LIBRARY(veri_lib, mi, veri_module)
-						veri_module->Accept(rw);
-				}
+				if (veri_lib) veri_libs.InsertLast(veri_lib);
 
 				Array *netlists = hier_tree::ElaborateAll(&veri_libs, &vhdl_libs, &parameters);
 				Netlist *nl;
@@ -2583,11 +2605,9 @@ struct VerificPass : public Pass {
 
 				if (veri_lib) {
 					// Also elaborate all root modules since they may contain bind statements
-					InitialAssertionRewriter rw;
 					MapIter mi;
 					VeriModule *veri_module;
 					FOREACH_VERILOG_MODULE_IN_LIBRARY(veri_lib, mi, veri_module) {
-						veri_module->Accept(rw);
 						if (!veri_module->IsRootModule()) continue;
 						veri_modules.InsertLast(veri_module);
 					}
